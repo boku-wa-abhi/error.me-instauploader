@@ -1,14 +1,14 @@
+import json
 import os
 import pandas as pd
 from datetime import datetime
+from json import JSONDecodeError
 from pathlib import Path
-from zoneinfo import ZoneInfo
 from instagrapi import Client
+from instagrapi.exceptions import ClipNotUpload, PhotoNotUpload, VideoNotUpload
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv'}
-DEFAULT_POST_TIMEZONE = 'America/New_York'
-DEFAULT_POST_HOUR = 19
 SESSION_FILE_PATH = 'insta_session.json'
 
 
@@ -28,6 +28,39 @@ def load_local_env_file(env_file_path):
         if key and key not in os.environ:
             os.environ[key] = value
 
+
+def load_session_settings(session_file_path):
+    session_path = Path(session_file_path)
+    if not session_path.exists():
+        return None
+
+    try:
+        with session_path.open('r', encoding='utf-8') as session_file:
+            return json.load(session_file)
+    except (JSONDecodeError, OSError) as exc:
+        invalid_path = session_path.with_suffix(f'{session_path.suffix}.invalid')
+        try:
+            session_path.replace(invalid_path)
+            print(
+                f"Existing session file was invalid and was moved to "
+                f"'{invalid_path.name}': {exc}"
+            )
+        except OSError:
+            print(f"Existing session file was invalid and will be ignored: {exc}")
+        return None
+
+
+def save_session_settings(client, session_file_path):
+    session_path = Path(session_file_path)
+    temp_path = session_path.with_suffix(f'{session_path.suffix}.tmp')
+
+    with temp_path.open('w', encoding='utf-8') as session_file:
+        json.dump(client.get_settings(), session_file, indent=4)
+
+    temp_path.replace(session_path)
+    print(f"Session saved to '{session_path.name}'")
+
+
 def login_with_session(client, username, password, session_file_path):
     """
     Login to Instagram using session caching. If a session file exists, it will be loaded;
@@ -41,20 +74,21 @@ def login_with_session(client, username, password, session_file_path):
     """
     client.username = username
     client.password = password
-    if os.path.exists(session_file_path):
-        # Load session if available
-        client.load_settings(session_file_path)
+
+    session_settings = load_session_settings(session_file_path)
+    if session_settings:
+        client.set_settings(session_settings)
         try:
             client.relogin()
+            save_session_settings(client, session_file_path)
             print("Session loaded successfully")
             return
         except Exception as e:
             print(f"Relogin failed: {e}, performing a fresh login")
-    
-    # If relogin fails or session file doesn't exist, perform a fresh login
+
     client.login(username, password)
-    client.dump_settings(session_file_path)
-    print("Logged in and session saved")
+    save_session_settings(client, session_file_path)
+    print("Logged in successfully")
 
 
 def resolve_media_path(file_path):
@@ -64,25 +98,48 @@ def resolve_media_path(file_path):
     return media_path.resolve()
 
 
-def get_post_timezone():
-    timezone_name = os.getenv('POST_TIMEZONE', DEFAULT_POST_TIMEZONE)
-    return ZoneInfo(timezone_name)
-
-
-def should_post_now():
-    post_timezone = get_post_timezone()
-    post_hour = int(os.getenv('POST_HOUR', DEFAULT_POST_HOUR))
-    current_time = datetime.now(post_timezone)
-
-    if current_time.hour != post_hour:
-        print(
-            f"Skipping run. Current time in {post_timezone.key}: "
-            f"{current_time.strftime('%Y-%m-%d %H:%M:%S')}. "
-            f"Scheduled hour is {post_hour:02d}:00."
-        )
+def resolve_challenge_if_needed(client, session_file_path):
+    last_json = client.last_json or {}
+    if last_json.get('message') != 'challenge_required':
         return False
 
+    print('Instagram requested a challenge. Enter the verification code when prompted.')
+    client.challenge_resolve(last_json)
+    save_session_settings(client, session_file_path)
+    print('Challenge resolved successfully')
     return True
+
+
+def upload_feed_media(client, media_path, caption):
+    media_suffix = Path(media_path).suffix.lower()
+
+    if media_suffix in IMAGE_EXTENSIONS:
+        client.photo_upload(media_path, caption)
+        print(f"Image uploaded as a post with caption: {caption}")
+        return
+
+    if media_suffix in VIDEO_EXTENSIONS:
+        client.video_upload(media_path, caption)
+        print(f"Video uploaded as a post with caption: {caption}")
+        return
+
+    raise ValueError(f"Unsupported media type for '{media_path}'")
+
+
+def upload_story_media(client, media_path):
+    media_suffix = Path(media_path).suffix.lower()
+
+    if media_suffix in IMAGE_EXTENSIONS:
+        client.photo_upload_to_story(media_path)
+        print("Image uploaded as a story")
+        return
+
+    if media_suffix in VIDEO_EXTENSIONS:
+        client.video_upload_to_story(media_path)
+        print("Video uploaded as a story")
+        return
+
+    raise ValueError(f"Unsupported media type for '{media_path}'")
 
 
 def upload_media_and_story(client, media_path, caption, username, password):
@@ -97,46 +154,66 @@ def upload_media_and_story(client, media_path, caption, username, password):
     password (str): Instagram password.
     """
     login_with_session(client, username, password, session_file_path=SESSION_FILE_PATH)
+    upload_errors = (PhotoNotUpload, VideoNotUpload, ClipNotUpload)
 
-    media_suffix = Path(media_path).suffix.lower()
+    def run_with_challenge_retry(action, action_name):
+        for attempt in range(2):
+            try:
+                action()
+                save_session_settings(client, SESSION_FILE_PATH)
+                return
+            except upload_errors as exc:
+                if attempt == 0 and resolve_challenge_if_needed(client, SESSION_FILE_PATH):
+                    print(f"Retrying {action_name} after challenge resolution")
+                    continue
+                raise RuntimeError(
+                    f"Instagram rejected the {action_name}. If the account is still "
+                    "under verification, complete the challenge in the Instagram app "
+                    "and retry."
+                ) from exc
 
-    if media_suffix in IMAGE_EXTENSIONS:
-        client.photo_upload(media_path, caption)
-        print(f"Image uploaded as a post with caption: {caption}")
-        client.photo_upload_to_story(media_path)
-        print("Image uploaded as a story")
-        return
-
-    if media_suffix in VIDEO_EXTENSIONS:
-        client.video_upload(media_path, caption)
-        print(f"Video uploaded as a post with caption: {caption}")
-        client.video_upload_to_story(media_path)
-        print("Video uploaded as a story")
-        return
-
-    raise ValueError(f"Unsupported media type for '{media_path}'")
+    run_with_challenge_retry(
+        lambda: upload_feed_media(client, media_path, caption),
+        'feed upload',
+    )
+    run_with_challenge_retry(
+        lambda: upload_story_media(client, media_path),
+        'story upload',
+    )
 
 
 def get_scheduled_media_row(schedule_csv_path):
-    # Load the media schedule
     schedule_df = pd.read_csv(schedule_csv_path)
     if schedule_df.empty:
         return pd.Series(dtype=object)
 
-    post_timezone = get_post_timezone()
-    current_date = datetime.now(post_timezone).date()
+    current_time = datetime.now()
+    current_date = current_time.date()
+    raw_schedule_values = schedule_df['Date & Time'].astype(str).str.strip()
 
-    schedule_df['Scheduled Date'] = pd.to_datetime(
-        schedule_df['Date & Time'],
+    schedule_df['Scheduled At'] = pd.to_datetime(
+        raw_schedule_values,
         errors='coerce'
-    ).dt.date
-    schedule_df = schedule_df.dropna(subset=['Scheduled Date'])
+    )
+    schedule_df['Has Explicit Time'] = raw_schedule_values.str.contains(':')
+    schedule_df = schedule_df.dropna(subset=['Scheduled At'])
 
-    todays_media = schedule_df.loc[schedule_df['Scheduled Date'] == current_date]
-    if todays_media.empty:
-        return pd.Series(dtype=object)
+    timed_rows = schedule_df.loc[
+        schedule_df['Has Explicit Time']
+        & (schedule_df['Scheduled At'].dt.date == current_date)
+        & (schedule_df['Scheduled At'] <= current_time)
+    ]
+    if not timed_rows.empty:
+        return timed_rows.sort_values('Scheduled At').iloc[-1]
 
-    return todays_media.iloc[0]
+    date_only_rows = schedule_df.loc[
+        ~schedule_df['Has Explicit Time']
+        & (schedule_df['Scheduled At'].dt.date == current_date)
+    ]
+    if not date_only_rows.empty:
+        return date_only_rows.iloc[0]
+
+    return pd.Series(dtype=object)
 
 
 # Load Instagram credentials from environment variables
@@ -147,24 +224,22 @@ INSTAGRAM_PASSWORD = os.getenv('INSTAGRAM_PASSWORD')
 if not INSTAGRAM_USERNAME or not INSTAGRAM_PASSWORD:
     raise RuntimeError('INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD must be set.')
 
-# Main execution flow
-if should_post_now():
-    media_row = get_scheduled_media_row('media_schedule.csv')
+media_row = get_scheduled_media_row('media_schedule.csv')
 
-    if not media_row.empty:
-        media_path = resolve_media_path(media_row['File Path'])
-        caption = media_row['Caption']
+if not media_row.empty:
+    media_path = resolve_media_path(media_row['File Path'])
+    caption = media_row['Caption']
 
-        if not media_path.exists():
-            raise FileNotFoundError(f"Scheduled media file does not exist: {media_path}")
+    if not media_path.exists():
+        raise FileNotFoundError(f"Scheduled media file does not exist: {media_path}")
 
-        instagram_client = Client()
-        upload_media_and_story(
-            instagram_client,
-            str(media_path),
-            caption,
-            INSTAGRAM_USERNAME,
-            INSTAGRAM_PASSWORD,
-        )
-    else:
-        print("No media scheduled for today.")
+    instagram_client = Client()
+    upload_media_and_story(
+        instagram_client,
+        str(media_path),
+        caption,
+        INSTAGRAM_USERNAME,
+        INSTAGRAM_PASSWORD,
+    )
+else:
+    print("No media scheduled for the current date/time.")

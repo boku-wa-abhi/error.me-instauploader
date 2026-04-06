@@ -3,7 +3,7 @@ name: Daily Instagram Post
 # Controls when the workflow will run
 on:
   schedule:
-    # These UTC runs let the script post at 7 PM America/New_York across DST.
+    # Update these cron values to the times you want GitHub Actions to run.
     - cron: '0 23 * * *'
     - cron: '0 0 * * *'
 
@@ -35,7 +35,5 @@ jobs:
         env:
           INSTAGRAM_USERNAME: ${{ secrets.INSTAGRAM_USERNAME }}
           INSTAGRAM_PASSWORD: ${{ secrets.INSTAGRAM_PASSWORD }}
-          POST_TIMEZONE: America/New_York
-          POST_HOUR: '19'
         run: |
           python script.py
