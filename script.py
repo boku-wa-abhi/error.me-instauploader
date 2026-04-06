@@ -1,11 +1,15 @@
-import io
 import os
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 from instagrapi import Client
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv'}
+DEFAULT_POST_TIMEZONE = 'America/New_York'
+DEFAULT_POST_HOUR = 19
+SESSION_FILE_PATH = 'insta_session.json'
 
 def login_with_session(client, username, password, session_file_path):
     """
@@ -36,127 +40,113 @@ def login_with_session(client, username, password, session_file_path):
     print("Logged in and session saved")
 
 
-def download_file_from_drive(service, folder_name, file_name):
+def resolve_media_path(file_path):
+    media_path = Path(str(file_path)).expanduser()
+    if not media_path.is_absolute():
+        media_path = Path(__file__).resolve().parent / media_path
+    return media_path.resolve()
+
+
+def get_post_timezone():
+    timezone_name = os.getenv('POST_TIMEZONE', DEFAULT_POST_TIMEZONE)
+    return ZoneInfo(timezone_name)
+
+
+def should_post_now():
+    post_timezone = get_post_timezone()
+    post_hour = int(os.getenv('POST_HOUR', DEFAULT_POST_HOUR))
+    current_time = datetime.now(post_timezone)
+
+    if current_time.hour != post_hour:
+        print(
+            f"Skipping run. Current time in {post_timezone.key}: "
+            f"{current_time.strftime('%Y-%m-%d %H:%M:%S')}. "
+            f"Scheduled hour is {post_hour:02d}:00."
+        )
+        return False
+
+    return True
+
+
+def upload_media_and_story(client, media_path, caption, username, password):
     """
-    Downloads a file from the specified Google Drive folder.
-
-    Parameters:
-    service: Authenticated Google Drive service object.
-    folder_name (str): The name of the folder in Google Drive.
-    file_name (str): The name of the file to download from the folder.
-    
-    Returns:
-    file_path (str): Path to the downloaded file.
-    """
-    folder_query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder'"
-    folder_results = service.files().list(q=folder_query, fields="files(id, name)").execute()
-    folders = folder_results.get('files', [])
-    
-    if not folders:
-        print(f"Folder '{folder_name}' not found.")
-        return None
-    
-    folder_id = folders[0]['id']
-    print(f"Found folder '{folder_name}' with ID: {folder_id}")
-
-    file_query = f"name = '{file_name}' and '{folder_id}' in parents"
-    file_results = service.files().list(q=file_query, fields="files(id, name)").execute()
-    files = file_results.get('files', [])
-    
-    if not files:
-        print(f"File '{file_name}' not found in folder '{folder_name}'.")
-        return None
-    
-    file_id = files[0]['id']
-    print(f"Found file '{file_name}' with ID: {file_id}")
-
-    request = service.files().get_media(fileId=file_id)
-    file_path = file_name
-    with io.FileIO(file_path, 'wb') as fh:
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-            print(f"Download progress: {int(status.progress() * 100)}%")
-    
-    print(f"File '{file_name}' downloaded successfully to '{file_path}'.")
-    return file_path
-
-def upload_video_and_story(client, video_path, caption, username, password):
-    """
-    Uploads a video to Instagram as both a post and a story.
+    Uploads an image or video to Instagram as both a post and a story.
 
     Parameters:
     client (Client): The instagrapi Client instance.
-    video_path (str): The file path of the video to upload.
+    media_path (str): The file path of the media to upload.
     caption (str): The caption to include with the post.
     username (str): Instagram username.
     password (str): Instagram password.
     """
-    login_with_session(client, username, password, session_file_path='insta_session.json')
-    
-    client.video_upload(video_path, caption)
-    print(f"Video uploaded as a post with caption: {caption}")
+    login_with_session(client, username, password, session_file_path=SESSION_FILE_PATH)
 
-    client.video_upload_to_story(video_path)
-    print("Video uploaded as a story")
+    media_suffix = Path(media_path).suffix.lower()
+
+    if media_suffix in IMAGE_EXTENSIONS:
+        client.photo_upload(media_path, caption)
+        print(f"Image uploaded as a post with caption: {caption}")
+        client.photo_upload_to_story(media_path)
+        print("Image uploaded as a story")
+        return
+
+    if media_suffix in VIDEO_EXTENSIONS:
+        client.video_upload(media_path, caption)
+        print(f"Video uploaded as a post with caption: {caption}")
+        client.video_upload_to_story(media_path)
+        print("Video uploaded as a story")
+        return
+
+    raise ValueError(f"Unsupported media type for '{media_path}'")
 
 
-def get_closest_media_row(schedule_csv_path):
+def get_scheduled_media_row(schedule_csv_path):
     # Load the media schedule
     schedule_df = pd.read_csv(schedule_csv_path)
+    if schedule_df.empty:
+        return pd.Series(dtype=object)
 
-    # Convert 'Date' column to datetime format and make it timezone-aware in UTC
-    schedule_df['Date & Time'] = pd.to_datetime(schedule_df['Date & Time']).dt.tz_localize('UTC')
+    post_timezone = get_post_timezone()
+    current_date = datetime.now(post_timezone).date()
 
-    # Get current time in UTC
-    current_time_utc = datetime.now(timezone.utc)
+    schedule_df['Scheduled Date'] = pd.to_datetime(
+        schedule_df['Date & Time'],
+        errors='coerce'
+    ).dt.date
+    schedule_df = schedule_df.dropna(subset=['Scheduled Date'])
 
-    # Calculate the absolute time delta and find the row with the minimum difference
-    schedule_df['Time Delta'] = (schedule_df['Date & Time'] - current_time_utc).abs()
-    closest_media_row = schedule_df.loc[schedule_df['Time Delta'].idxmin()]
+    todays_media = schedule_df.loc[schedule_df['Scheduled Date'] == current_date]
+    if todays_media.empty:
+        return pd.Series(dtype=object)
 
-    return closest_media_row
+    return todays_media.iloc[0]
 
-# Environment Variables and Authentication
-SERVICE_ACCOUNT_INFO = os.getenv('GOOGLE_CREDENTIAL')
 
 # Load Instagram credentials from environment variables
 INSTAGRAM_USERNAME = os.getenv('INSTAGRAM_USERNAME')
 INSTAGRAM_PASSWORD = os.getenv('INSTAGRAM_PASSWORD')
 
-credentials = service_account.Credentials.from_service_account_info(
-    eval(SERVICE_ACCOUNT_INFO),
-    scopes=['https://www.googleapis.com/auth/drive']
-)
-service = build('drive', 'v3', credentials=credentials)
-
-# Instagram session file path
-SESSION_FILE_PATH = 'insta_session.json'
-
-# Load media schedule
-media_row = get_closest_media_row('media_schedule.csv')
+if not INSTAGRAM_USERNAME or not INSTAGRAM_PASSWORD:
+    raise RuntimeError('INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD must be set.')
 
 # Main execution flow
-if not media_row.empty:
-    file_name = media_row['File Path']
-    caption = media_row["Caption"]
-    media_path = download_file_from_drive(service, folder_name='finding__good__songs__', file_name=file_name)
-    
-    if media_path:
-        
-        # Initialize Instagram client and upload video
-        instagram_client = Client()
-        upload_video_and_story(instagram_client, media_path, caption, INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+if should_post_now():
+    media_row = get_scheduled_media_row('media_schedule.csv')
 
-        # Clean up the downloaded video file
-        os.remove(media_path)
-        print("Temporary media file removed after upload.")
-        
-        # Remove the generated .jpg file with the same base name
-        jpg_file_path = media_path + '.jpg'
-        if os.path.exists(jpg_file_path):
-            os.remove(jpg_file_path)
-            print(f"Temporary file '{jpg_file_path}' removed after upload.")
-else:
-    print("No media scheduled for today")
+    if not media_row.empty:
+        media_path = resolve_media_path(media_row['File Path'])
+        caption = media_row['Caption']
+
+        if not media_path.exists():
+            raise FileNotFoundError(f"Scheduled media file does not exist: {media_path}")
+
+        instagram_client = Client()
+        upload_media_and_story(
+            instagram_client,
+            str(media_path),
+            caption,
+            INSTAGRAM_USERNAME,
+            INSTAGRAM_PASSWORD,
+        )
+    else:
+        print("No media scheduled for today.")
