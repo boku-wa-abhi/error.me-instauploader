@@ -11,6 +11,23 @@ DEFAULT_POST_TIMEZONE = 'America/New_York'
 DEFAULT_POST_HOUR = 19
 SESSION_FILE_PATH = 'insta_session.json'
 
+
+def load_local_env_file(env_file_path):
+    if not env_file_path.exists():
+        return
+
+    for raw_line in env_file_path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+
+        key, value = line.split('=', 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+
+        if key and key not in os.environ:
+            os.environ[key] = value
+
 def login_with_session(client, username, password, session_file_path):
     """
     Login to Instagram using session caching. If a session file exists, it will be loaded;
@@ -123,6 +140,7 @@ def get_scheduled_media_row(schedule_csv_path):
 
 
 # Load Instagram credentials from environment variables
+load_local_env_file(Path(__file__).resolve().parent / '.env')
 INSTAGRAM_USERNAME = os.getenv('INSTAGRAM_USERNAME')
 INSTAGRAM_PASSWORD = os.getenv('INSTAGRAM_PASSWORD')
 
